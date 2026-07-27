@@ -1,0 +1,24 @@
+{
+  "name": "smart-write",
+  "version": "1.0.0",
+  "description": "Defensive Smart Edit MCP server + reflective memory harness for AI pair coding",
+  "type": "module",
+  "bin": {
+    "smart-write": "dist/server.js"
+  },
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
