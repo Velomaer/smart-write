@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, performSmartEdit, readRegistry } from "./core.js";
-import { rememberFailure } from "./memory.js";
+import { rememberFailure, loadRules } from "./memory.js";
 
 const server = new McpServer({ name: "smart-write", version: "1.0.0" });
 
@@ -51,6 +51,25 @@ server.tool(
   async ({ file, error_type, lesson }) => {
     return text(rememberFailure(file, error_type, lesson));
   },
+);
+
+server.registerResource(
+  "edit-rules",
+  "smartwrite://rules",
+  {
+    title: "Smart-Write 编辑规则",
+    description: "已沉淀的编辑失败规则（INDEX + rules/*）。新会话可读取本资源作为开局注入。",
+    mimeType: "text/markdown",
+  },
+  async (uri) => ({
+    contents: [
+      {
+        uri: uri.href,
+        mimeType: "text/markdown",
+        text: loadRules() || "（暂无已沉淀规则）",
+      },
+    ],
+  }),
 );
 
 const transport = new StdioServerTransport();

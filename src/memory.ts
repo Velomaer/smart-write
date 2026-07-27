@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWrite } from "./core.js";
@@ -54,4 +54,23 @@ export function rememberFailure(file: string, errorType: string, lesson: string)
   }
 
   return `已沉淀规则 ${slug}（第 ${hits} 次）。`;
+}
+
+/**
+ * Aggregate all persisted edit rules into one injectable markdown block:
+ * the INDEX overview plus the full body of every rule under rules/.
+ * Returns "" when nothing has been remembered yet, so callers can skip injection.
+ */
+export function loadRules(): string {
+  if (!existsSync(INDEX)) return "";
+  const parts: string[] = [readFileSync(INDEX, "utf8").trim()];
+
+  if (existsSync(RULES_DIR)) {
+    for (const f of readdirSync(RULES_DIR).sort()) {
+      if (f.endsWith(".md")) parts.push(readFileSync(join(RULES_DIR, f), "utf8").trim());
+    }
+  }
+
+  // Only the default template exists (no real rules) -> nothing worth injecting.
+  return parts.length > 1 ? parts.join("\n\n---\n\n") : "";
 }
