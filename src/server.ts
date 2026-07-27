@@ -27,15 +27,16 @@ server.tool(
 
 server.tool(
   "smart_edit",
-  "防御性编辑：CAS 指纹校验 + 唯一锚点替换 + 幂等 + 写后回读。用于替代全量覆盖，禁止用它做整份文件替换。失败时返回结构化错误（ERR[...] / WARN[...]）供归纳成规则。",
+  "防御性编辑：CAS 指纹校验 + 唯一锚点替换 + 幂等 + 写后回读。用于替代全量覆盖，禁止用它做整份文件替换。两步写入：先 preview=true 拿到 diff 预览给用户确认，再用相同 old/new 以 preview=false 实际写入。失败时返回结构化错误（ERR[...] / WARN[...]）供归纳成规则。",
   {
     path: z.string().describe("文件路径，建议绝对路径"),
     old: z.string().describe("要被替换的原始片段，必须在文件中唯一出现"),
     new: z.string().describe("替换后的新片段"),
+    preview: z.boolean().optional().describe("true=只跑校验并返回 diff 预览、不写盘（dry-run）；false/省略=实际写入。默认先 preview 再写。"),
   },
-  async ({ path, old, new: newStr }) => {
+  async ({ path, old, new: newStr, preview }) => {
     const abs = resolve(path);
-    const result = performSmartEdit(abs, old, newStr);
+    const result = performSmartEdit(abs, old, newStr, preview ?? false);
     return text(result.message);
   },
 );

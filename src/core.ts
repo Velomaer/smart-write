@@ -76,15 +76,27 @@ export function lineCount(text: string): number {
 export type EditResult =
   | { kind: "ok"; message: string }
   | { kind: "noop"; message: string }
+  | { kind: "preview"; message: string }
   | { kind: "warn"; errorType: "Duplicate"; message: string }
   | { kind: "err"; errorType: "Unread" | "Stale" | "NotFound" | "Ambiguous" | "VerifyFail"; message: string };
+
+/** Render a unified-style before/after block for one anchor replacement (preview only). */
+function buildDiff(oldStr: string, newStr: string): string {
+  const minus = oldStr.split("\n").map((l) => `- ${l}`).join("\n");
+  const plus = newStr === "" ? "  (删除，无新增内容)" : newStr.split("\n").map((l) => `+ ${l}`).join("\n");
+  return `${minus}\n${plus}`;
+}
 
 /**
  * Pure decision + effect for one guarded edit. Sequence: read-registry gate (M1) ->
  * CAS fingerprint (M2) -> idempotency (M4) -> unique anchor (M3) -> atomic write (M6) ->
  * post-read verify + dup scan (M5). Returns a typed result; performs the write only when safe.
+ *
+ * When `preview` is true, all gates (M1-M4) still run, but instead of writing it returns a
+ * diff of the pending change (and pre-warns if the write would create a duplicate). Nothing
+ * touches disk and the read registry is left untouched, so a following real edit re-validates CAS.
  */
-export function performSmartEdit(path: string, oldStr: string, newStr: string): EditResult {
+export function performSmartEdit(path: string, oldStr: string, newStr: string, preview = false): EditResult {
   // Mechanism 1: must have been read this session.
   if (!readRegistry.has(path)) {
     return { kind: "err", errorType: "Unread", message: `ERR[Unread] 该文件本轮未读取，请先 read_file 再改：${path}` };
@@ -116,6 +128,19 @@ export function performSmartEdit(path: string, oldStr: string, newStr: string): 
   }
 
   const updated = disk.replace(oldStr, newStr);
+
+  // Preview (dry-run): all gates passed, but do not write. Return the diff and pre-warn on duplicates.
+  if (preview) {
+    const diff = buildDiff(oldStr, newStr);
+    const dups = duplicateScan(updated);
+    const warn = dups.length > 0 ? `\n⚠ 应用后可能残留：${dups.join("; ")}` : "";
+    const delta = lineCount(updated) - lineCount(disk);
+    return {
+      kind: "preview",
+      message: `PREVIEW ${path}（行数变化 ${delta >= 0 ? "+" : ""}${delta}，未写入）\n${diff}${warn}\n\n确认无误后，用相同 old/new 再调一次（preview=false）实际写入。`,
+    };
+  }
+
   atomicWrite(path, updated);
 
   // Mechanism 5: post-write read-back self-check.

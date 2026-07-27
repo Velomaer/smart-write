@@ -15,12 +15,13 @@
 | 工具 | 作用 | 防御机制 |
 |---|---|---|
 | `read_file` | 读文件并登记内容指纹 | M1 读后写 |
-| `smart_edit` | 定点替换，写前 CAS 校验、锚点唯一、幂等，写后回读自检、原子写 | M2/M3/M4/M5/M6 |
+| `smart_edit` | 定点替换，写前 CAS 校验、锚点唯一、幂等，写后回读自检、原子写；支持 `preview` 干跑出 diff | M2/M3/M4/M5/M6 |
 | `remember_failure` | 把一次失败归纳成规则写入 `memory/`（带查重） | 右半环 |
 
 `smart_edit` 的返回是**结构化信号**，直接决定下一步：
 
 - `OK ...` / `OK[NoOp] ...` —— 成功或幂等跳过。
+- `PREVIEW ...` —— `preview=true` 干跑：已通过全部校验，返回 diff 但未写盘。→ 给用户看 diff，确认后用相同 old/new 以 `preview=false` 写入。
 - `ERR[Unread]` —— 没先 `read_file`。→ 先读。
 - `ERR[Stale]` —— 磁盘指纹与上次读取不符（被格式化/他人改动）。→ 重新 `read_file` 再改。
 - `ERR[NotFound]` —— old 锚点不存在（旧版本/幻觉）。→ 重新 `read_file`，别硬写。
@@ -84,11 +85,12 @@ npm run build       # 产出 dist/server.js
 # 编辑纪律（强制）
 1. 禁止使用内置全量文件写入/覆盖。所有文件修改必须走 smart_edit 工具。
 2. 编辑任何文件前，必须先用 read_file 读取它（否则 smart_edit 会返回 ERR[Unread]）。
-3. smart_edit 返回 ERR[...] 时：不得原样重试，必须按错误提示行动——
+3. 两步写入：先以 preview=true 调 smart_edit 拿到 diff，展示给用户；用户确认后，再用**相同的 old/new** 以 preview=false 实际写入。未经确认不得直接写入。
+4. smart_edit 返回 ERR[...] 时：不得原样重试，必须按错误提示行动——
    - ERR[Stale]/ERR[NotFound] → 重新 read_file 再改；
    - ERR[Ambiguous] → 给 old 补充上下文使其唯一。
-4. 当同一文件累计 ≥2 次 ERR，或任务收尾时，调用 remember_failure 归纳规则。
-5. 每次新会话开局，先读取 smart-write/memory/INDEX.md，遵守其中已沉淀的规则。
+5. 当同一文件累计 ≥2 次 ERR，或任务收尾时，调用 remember_failure 归纳规则。
+6. 每次新会话开局，先读取 /Users/wangxiaoyu.331/mcp/smart-write/memory/INDEX.md（或读取 MCP 资源 smartwrite://rules），遵守其中已沉淀的规则。
 ```
 
 ---
