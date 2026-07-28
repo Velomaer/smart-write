@@ -1,3 +1,11 @@
 node_modules/
 dist/
 *.log
+.DS_Store
+
+# 运行时沉淀的编辑规则记忆——纯本地、含真实项目路径，不进 git 历史。
+memory/rules/
+# INDEX.md 仍作为开局注入模板被 git 跟踪（HEAD 保留纯模板）。
+# 其运行时追加的规则行不入库，靠 skip-worktree 让 git 忽略本地差异：
+#   git update-index --skip-worktree memory/INDEX.md
+# （gitignore 对已跟踪文件无效，故不在此忽略 INDEX.md 本身。）
