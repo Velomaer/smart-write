@@ -129,7 +129,10 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 # 编辑纪律（强制）
 1. 禁止使用内置全量文件写入/覆盖。所有文件修改必须走 smart_edit 工具。
 2. 编辑任何文件前，必须先用 read_file 读取它（否则 smart_edit 会返回 ERR[Unread]）。
-3. 两步写入：先以 preview=true 调 smart_edit 拿到 diff，展示给用户；用户确认后，再用**相同的 old/new** 以 preview=false 实际写入。未经确认不得直接写入。
+3. 写入分级（preview 只买"人工看 diff 再放行"，不买安全——M1~M6 六道校验在单步 preview=false 时同样全跑）：
+   - **高风险改动**走两步：先以 preview=true 拿 diff 展示给用户，确认后再用**相同的 old/new** 以 preview=false 写入。高风险 = 改动范围大 / 关键路径 / 你对锚点或结果没把握 / 用户要求先看。
+   - **低风险改动**（小范围、锚点明确、你有把握）可直接 preview=false 单步写入，省去 preview 往返。
+   - 拿不准时，按高风险走两步。
 4. smart_edit 返回 ERR[...] 时：不得原样重试，必须按错误提示行动——
    - ERR[Stale]/ERR[NotFound] → 重新 read_file 再改；
    - ERR[Ambiguous] → 给 old 补充上下文使其唯一。
