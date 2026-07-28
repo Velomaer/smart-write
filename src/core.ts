@@ -10,6 +10,13 @@ export function fingerprint(text: string): string {
 /** Session-scoped map: absolute path -> fingerprint at last read. Cleared on process restart (intentional). */
 export const readRegistry = new Map<string, string>();
 
+/**
+ * Session-scoped record of the last preview per path: the disk fingerprint the diff was computed
+ * against, plus the anchors used. Lets a subsequent Stale error tell the user their previewed diff
+ * went stale (disk moved between preview and write) rather than emitting a bare, confusing Stale.
+ */
+export const previewRegistry = new Map<string, { fingerprint: string; oldStr: string; newStr: string }>();
+
 /** Mechanism 6: temp file + fsync + atomic rename, so a file is never observed half-written. */
 export function atomicWrite(path: string, content: string): void {
   const dir = dirname(path) || ".";
@@ -31,24 +38,38 @@ export function atomicWrite(path: string, content: string): void {
 
 /**
  * Mechanism 5: structural duplicate scan. Approximate (regex, not AST), but reliably catches
- * the typical long-context residue: an entire method / type / import written twice.
+ * the typical long-context residue: an entire method / type / import / file written twice.
+ *
+ * Precision over recall — a false WARN cries wolf and erodes trust, so every pattern is chosen
+ * to avoid false positives:
+ *  - method definitions REQUIRE an access modifier, so control flow (`if`/`for`/`while`/`catch`),
+ *    lambdas, and anonymous classes (`new X() {`) never match, and are keyed by name+params so
+ *    legitimate overloads stay distinct while a wholesale-copied method is still caught;
+ *  - a second `package` declaration is a zero-ambiguity signal that a whole file was appended twice.
  */
 export function duplicateScan(content: string): string[] {
   const warnings: string[] = [];
-  const patterns: Array<{ re: RegExp; label: string }> = [
-    // method signature: modifiers + return type + name(...) {
-    { re: /\b(?:public|private|protected)?\s*(?:static\s+)?[\w<>\[\],\s]+?\s+(\w+)\s*\([^)]*\)\s*\{/g, label: "方法" },
-    { re: /\b(?:class|interface|enum)\s+(\w+)/g, label: "类型" },
-    { re: /^\s*import\s+([\w.]+);/gm, label: "import" },
+  const patterns: Array<{ re: RegExp; label: string; key: (m: RegExpMatchArray) => string }> = [
+    // Two package declarations == an entire file duplicated below itself.
+    { re: /^[ \t]*package\s+([\w.]+)\s*;/gm, label: "package", key: (m) => m[1] },
+    { re: /^[ \t]*import\s+(?:static\s+)?([\w.*]+)\s*;/gm, label: "import", key: (m) => m[1] },
+    { re: /\b(?:class|interface|enum|record)\s+(\w+)/g, label: "类型", key: (m) => m[1] },
+    // Method DEFINITION: leading access modifier + optional modifiers + return type + name(params){.
+    // Keyed by name+normalized params: identical copy -> same key (caught); overload -> different key (spared).
+    {
+      re: /\b(?:public|private|protected)\s+(?:(?:static|final|abstract|synchronized|native|default)\s+)*[\w<>\[\],.\s]+?\b(\w+)\s*\(([^)]*)\)\s*(?:throws\b[^{;]*)?\{/g,
+      label: "方法",
+      key: (m) => `${m[1]}(${m[2].replace(/\s+/g, " ").trim()})`,
+    },
   ];
-  for (const { re, label } of patterns) {
+  for (const { re, label, key } of patterns) {
     const counts = new Map<string, number>();
     for (const m of content.matchAll(re)) {
-      const name = m[1];
-      counts.set(name, (counts.get(name) ?? 0) + 1);
+      const k = key(m);
+      counts.set(k, (counts.get(k) ?? 0) + 1);
     }
-    for (const [name, n] of counts) {
-      if (n >= 2) warnings.push(`${label} \`${name}\` 出现 ${n} 次`);
+    for (const [k, n] of counts) {
+      if (n >= 2) warnings.push(`${label} \`${k}\` 出现 ${n} 次`);
     }
   }
   return warnings;
@@ -106,10 +127,17 @@ export function performSmartEdit(path: string, oldStr: string, newStr: string, p
 
   // Mechanism 2: CAS — disk fingerprint must match what we last read.
   if (fingerprint(disk) !== readRegistry.get(path)) {
+    // If the user previewed this exact edit and disk has since moved, say so — otherwise the diff
+    // they just confirmed silently becomes a bare Stale and looks like the preview was pointless.
+    const prev = previewRegistry.get(path);
+    const afterPreview =
+      prev && prev.oldStr === oldStr && prev.newStr === newStr && prev.fingerprint !== fingerprint(disk)
+        ? " 注意：这正是你刚才 preview 过的编辑，preview 之后磁盘又变了，那份 diff 已过期。"
+        : "";
     return {
       kind: "err",
       errorType: "Stale",
-      message: `ERR[Stale] ${path} 磁盘已被改动（现 ${lineCount(disk)} 行），你的上下文过期。请重新 read_file 后再改，切勿覆盖。`,
+      message: `ERR[Stale] ${path} 磁盘已被改动（现 ${lineCount(disk)} 行），你的上下文过期。请重新 read_file 后再改，切勿覆盖。${afterPreview}`,
     };
   }
 
@@ -135,6 +163,8 @@ export function performSmartEdit(path: string, oldStr: string, newStr: string, p
     const dups = duplicateScan(updated);
     const warn = dups.length > 0 ? `\n⚠ 应用后可能残留：${dups.join("; ")}` : "";
     const delta = lineCount(updated) - lineCount(disk);
+    // Record what this diff was computed against, so a later Stale can point back at it.
+    previewRegistry.set(path, { fingerprint: fingerprint(disk), oldStr, newStr });
     return {
       kind: "preview",
       message: `PREVIEW ${path}（行数变化 ${delta >= 0 ? "+" : ""}${delta}，未写入）\n${diff}${warn}\n\n确认无误后，用相同 old/new 再调一次（preview=false）实际写入。`,
@@ -142,6 +172,8 @@ export function performSmartEdit(path: string, oldStr: string, newStr: string, p
   }
 
   atomicWrite(path, updated);
+  // The preview (if any) has now been consumed by a real write; drop it so it can't mislead later.
+  previewRegistry.delete(path);
 
   // Mechanism 5: post-write read-back self-check.
   const after = readFileSync(path, "utf8");

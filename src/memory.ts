@@ -10,10 +10,15 @@ const RULES_DIR = join(MEM_DIR, "rules");
 const INDEX = join(MEM_DIR, "INDEX.md");
 
 function slugify(input: string): string {
-  return input
-    .replace(/[^\w]+/g, "-")
+  // Keep Unicode letters/numbers (\p{L}\p{N}) — not just ASCII \w — so that filenames
+  // distinguished only by CJK characters (SAI检查手册 vs SAI订单手册) don't collapse to the
+  // same slug and overwrite each other's rule file. Only true separators become "-".
+  const slug = input
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase();
+  // Guard against an all-separator input producing an empty (hidden ".md") filename.
+  return slug || "rule";
 }
 
 /**
@@ -49,6 +54,9 @@ export function rememberFailure(file: string, errorType: string, lesson: string)
   const line = `- [${slug}](rules/${slug}.md) — ${shortLesson}\n`;
   let idx = existsSync(INDEX) ? readFileSync(INDEX, "utf8") : "# 编辑规则记忆索引\n\n开局注入：新会话开始时先读本文件，遵守其中已沉淀的规则。\n\n";
   if (!idx.includes(`(rules/${slug}.md)`)) {
+    // Guarantee a newline boundary: a hand-written INDEX may end on a comment or a line with no
+    // trailing "\n", and bare `idx += line` would glue that line to the rule line (broken markdown).
+    if (idx.length > 0 && !idx.endsWith("\n")) idx += "\n";
     idx += line;
     atomicWrite(INDEX, idx);
   }
