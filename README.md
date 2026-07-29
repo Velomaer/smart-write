@@ -55,7 +55,7 @@ read_file ──登记指纹──► smart_edit ──六道校验──► 写
 ### 记忆的沉淀与注入
 
 - 失败被拦下 → `remember_failure` 归纳成带 frontmatter 的规则文件写入 `memory/rules/`。同 `文件+错误类型` 只累加 `hits`、**不新建文件**，所以规则数上界是 `唯一文件数 × 错误类型数`，不是失败次数。
-- 开局注入时，`smartwrite://rules` 资源按 **`hits` 降序取 Top-N（默认 30）**注入完整规则，长尾只在 `INDEX.md` 留摘要行、需要时按路径读取。注入 token **有上界**，不随规则库无限膨胀。调整上限见 `src/memory.ts` 里的 `MAX_INJECTED_RULES`。
+- 开局注入时，`smartwrite://rules` 资源按 **`hits` 降序取 Top-N（默认 30）** 注入规则**正文**——只保留 lesson 本体，剥掉 frontmatter（`name/type/trigger/hits`）和"(根因类型…)"尾注这些对"该怎么改"无指导的噪声。长尾（第 N+1 条起）**只注入一行摘要**（路径 + lesson 摘要，从 rules 现拼、不搭 INDEX 全文的便车），需要时按路径读取正文。高频规则因此**只出现一次**（正文，不再重复摘要行）。注入 token **有上界**，不随规则库无限膨胀。调整上限见 `src/memory.ts` 里的 `MAX_INJECTED_RULES`。
 
 ---
 
@@ -169,4 +169,4 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 - `readRegistry` / `previewRegistry` 是**进程内内存**，客户端重启即清空 —— 这是有意的，它只在单次会话内有效；跨会话的持久知识全部沉淀在 `memory/`。
 - `duplicateScan` 的 Java 正则是够用的**近似版**，能拦住"整个方法被写两遍"这类典型残留；要严谨可换成基于 AST 的检测。
 - `smart_edit` 只做**单点唯一替换**，不支持一次多处替换（多处请多次调用，每次锚点唯一），这正是防重复的代价与保证。
-- Top-N 注入默认 30 条。真实项目跑久了规则变多时，靠 `hits` 排序让高频教训优先注入；若嫌注入过重或过薄，改 `src/memory.ts` 的 `MAX_INJECTED_RULES`。
+- Top-N 注入默认 30 条正文。真实项目跑久了规则变多时，靠 `hits` 排序让高频教训优先注入完整正文，第 31 条起降级为一行摘要；若嫌注入过重或过薄，改 `src/memory.ts` 的 `MAX_INJECTED_RULES`。

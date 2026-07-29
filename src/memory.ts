@@ -22,6 +22,15 @@ function slugify(input: string): string {
 }
 
 /**
+ * One-line summary of a lesson for an index/tail entry: collapse all whitespace to single spaces
+ * (so a multi-line lesson can't fold and break the markdown list) and cap the length.
+ */
+function summarize(lesson: string, max = 80): string {
+  const oneLine = lesson.replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
+}
+
+/**
  * Persist one smart_edit failure as a long-term rule (frontmatter file + index line).
  * Dedup: an existing rule of the same file+type is strengthened (hits++), never duplicated —
  * otherwise the memory store would grow its own duplicate residue.
@@ -50,8 +59,7 @@ export function rememberFailure(file: string, errorType: string, lesson: string)
     `（根因类型：${errorType}；已触发 ${hits} 次）\n`;
   atomicWrite(rulePath, body);
 
-  const shortLesson = lesson.length > 80 ? lesson.slice(0, 80) : lesson;
-  const line = `- [${slug}](rules/${slug}.md) — ${shortLesson}\n`;
+  const line = `- [${slug}](rules/${slug}.md) — ${summarize(lesson)}\n`;
   let idx = existsSync(INDEX) ? readFileSync(INDEX, "utf8") : "# 编辑规则记忆索引\n\n开局注入：新会话开始时先读本文件，遵守其中已沉淀的规则。\n\n";
   if (!idx.includes(`(rules/${slug}.md)`)) {
     // Guarantee a newline boundary: a hand-written INDEX may end on a comment or a line with no
@@ -67,8 +75,8 @@ export function rememberFailure(file: string, errorType: string, lesson: string)
 /**
  * Cap on how many rule bodies get injected at session start. The store grows unbounded
  * over a project's life, but injection cost must not: only the highest-hits (most-repeated)
- * rules are worth the tokens. The long tail stays listed in INDEX and readable on demand.
- * Tune here if injection feels too heavy or too thin.
+ * rules are worth injecting in full. The long tail is injected as one-line summaries only
+ * (path + lesson gist), readable in full on demand. Tune here if injection feels heavy/thin.
  */
 const MAX_INJECTED_RULES = 30;
 
@@ -79,34 +87,71 @@ function parseHits(body: string): number {
 }
 
 /**
- * Aggregate persisted edit rules into one injectable markdown block: the INDEX overview plus
- * the full body of the top-MAX_INJECTED_RULES rules by hit count. Bodies beyond the cap are
- * omitted (but still summarized in INDEX and readable via their rules/ path), so injection cost
- * stays bounded as the store grows. The omission is announced, never silent.
- * Returns "" when nothing has been remembered yet, so callers can skip injection.
+ * Strip a rule file down to the lesson itself — the only part that guides future edits.
+ * Drops the YAML frontmatter (name/type/trigger/hits: sorting/bookkeeping metadata, not
+ * behavior) and the auto-appended provenance note "（根因类型：…；已触发 N 次）". Both are
+ * dead weight in the injected context. Idempotent on hand-written rules that lack either.
+ */
+function extractLesson(body: string): string {
+  return body
+    .replace(/^---\n[\s\S]*?\n---\n/, "")
+    .replace(/\n*（根因类型：[\s\S]*?）\s*$/, "")
+    .trim();
+}
+
+/**
+ * The human-authored INDEX preamble ONLY — its heading and framing lines, with the
+ * auto-appended `- [slug](rules/…)` summary lines and the `<!-- example -->` comments removed.
+ * Those summary lines are exactly what we must NOT re-inject: a Top-N rule already contributes
+ * its full body below, so its index line would be a duplicate; low-freq summaries are rebuilt
+ * fresh from the rules array (source of truth) rather than trusted from INDEX.
+ */
+function indexHeader(): string {
+  if (!existsSync(INDEX)) return "";
+  return readFileSync(INDEX, "utf8")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .split("\n")
+    .filter((l) => !l.trimStart().startsWith("- ["))
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Aggregate persisted edit rules into one injectable markdown block:
+ *  - a short header (the INDEX preamble, minus its redundant summary lines);
+ *  - the full lesson (frontmatter/provenance stripped) of the top-MAX_INJECTED_RULES by hits;
+ *  - the remaining low-freq rules as one-line summaries only (path + gist), readable on demand.
+ * A Top-N rule therefore appears exactly once (body, no duplicate index line), and injection
+ * cost stays bounded as the store grows. Returns "" when nothing has been remembered yet.
  */
 export function loadRules(): string {
-  if (!existsSync(INDEX)) return "";
-  const parts: string[] = [readFileSync(INDEX, "utf8").trim()];
+  if (!existsSync(RULES_DIR)) return "";
 
-  if (existsSync(RULES_DIR)) {
-    const rules = readdirSync(RULES_DIR)
-      .filter((f) => f.endsWith(".md"))
-      .map((f) => {
-        const body = readFileSync(join(RULES_DIR, f), "utf8").trim();
-        return { f, body, hits: parseHits(body) };
-      })
-      // Highest hits first; ties broken by filename so output is deterministic across runs.
-      .sort((a, b) => b.hits - a.hits || a.f.localeCompare(b.f));
+  const rules = readdirSync(RULES_DIR)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => {
+      const body = readFileSync(join(RULES_DIR, f), "utf8");
+      return { f, lesson: extractLesson(body), hits: parseHits(body) };
+    })
+    // Highest hits first; ties broken by filename so output is deterministic across runs.
+    .sort((a, b) => b.hits - a.hits || a.f.localeCompare(b.f));
 
-    for (const r of rules.slice(0, MAX_INJECTED_RULES)) parts.push(r.body);
+  if (rules.length === 0) return "";
 
-    const omitted = rules.length - Math.min(rules.length, MAX_INJECTED_RULES);
-    if (omitted > 0) {
-      parts.push(`（另有 ${omitted} 条低频规则未全量注入，摘要见上方 INDEX，需要时按 rules/ 路径读取。）`);
-    }
+  const header = indexHeader();
+  const parts: string[] = header ? [header] : [];
+
+  // High-freq: inject the lesson body only (no frontmatter, no provenance tail, no index line).
+  for (const r of rules.slice(0, MAX_INJECTED_RULES)) parts.push(r.lesson);
+
+  // Low-freq: one-line summary + path only, so injection stays bounded. Announced, never silent.
+  const tail = rules.slice(MAX_INJECTED_RULES);
+  if (tail.length > 0) {
+    const lines = tail
+      .map((r) => `- [${r.f.replace(/\.md$/, "")}](rules/${r.f}) — ${summarize(r.lesson)}`)
+      .join("\n");
+    parts.push(`另有 ${tail.length} 条低频规则未注入正文（需要时按 rules/ 路径读取）：\n${lines}`);
   }
 
-  // Only the default template exists (no real rules) -> nothing worth injecting.
-  return parts.length > 1 ? parts.join("\n\n---\n\n") : "";
+  return parts.join("\n\n---\n\n");
 }
