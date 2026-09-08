@@ -9,3 +9,14 @@ memory/rules/
 # 其运行时追加的规则行不入库，靠 skip-worktree 让 git 忽略本地差异：
 #   git update-index --skip-worktree memory/INDEX.md
 # （gitignore 对已跟踪文件无效，故不在此忽略 INDEX.md 本身。）
+
+# IDE settings
+.idea/
+
+# Local CodeGraph index
+.codegraph/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
