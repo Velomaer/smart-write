@@ -1,157 +1,296 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { atomicWrite } from "./core.js";
+import { atomicWrite, fingerprint } from "./core.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// dist/memory.js -> ../memory ; src/memory.ts (tsx) -> ../memory . Both resolve to smart-write/memory.
-const MEM_DIR = join(HERE, "..", "memory");
+const MEM_DIR = process.env.SMART_WRITE_MEMORY_DIR
+  ? resolve(process.env.SMART_WRITE_MEMORY_DIR)
+  : join(HERE, "..", "memory");
 const RULES_DIR = join(MEM_DIR, "rules");
+const GLOBAL_RULES_DIR = join(RULES_DIR, "global");
+const SCOPED_RULES_DIR = join(RULES_DIR, "scoped");
 const INDEX = join(MEM_DIR, "INDEX.md");
 
+const MAX_GLOBAL_RULES = 20;
+const MAX_SCOPED_SUMMARIES = 10;
+const MAX_LESSON_VARIANTS = 5;
+const MAX_EXAMPLES = 10;
+
+export type MemoryScope = "global" | "file";
+
+export interface RememberFailureOptions {
+  scope?: MemoryScope;
+  causeCode?: string;
+  projectRoot?: string;
+  projectId?: string;
+}
+
+export interface LessonVariant {
+  text: string;
+  hash: string;
+  hits: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+}
+
+export interface RuleExample {
+  projectId: string;
+  relativePath: string;
+  hits: number;
+  lastSeenAt: string;
+}
+
+export interface RuleRecord {
+  schemaVersion: 2;
+  id: string;
+  scope: MemoryScope;
+  errorType: string;
+  causeCode: string;
+  hits: number;
+  createdAt: string;
+  updatedAt: string;
+  lessons: LessonVariant[];
+  examples: RuleExample[];
+  target?: { projectId: string; relativePath: string; pathHash: string };
+}
+
+interface RuleContext {
+  scope: MemoryScope;
+  errorType: string;
+  causeCode: string;
+  projectId: string;
+  relativePath: string;
+  pathHash: string;
+  id: string;
+  rulePath: string;
+}
+
 function slugify(input: string): string {
-  // Keep Unicode letters/numbers (\p{L}\p{N}) — not just ASCII \w — so that filenames
-  // distinguished only by CJK characters (SAI检查手册 vs SAI订单手册) don't collapse to the
-  // same slug and overwrite each other's rule file. Only true separators become "-".
   const slug = input
     .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase();
-  // Guard against an all-separator input producing an empty (hidden ".md") filename.
   return slug || "rule";
 }
 
-/**
- * One-line summary of a lesson for an index/tail entry: collapse all whitespace to single spaces
- * (so a multi-line lesson can't fold and break the markdown list) and cap the length.
- */
+function normalizePath(input: string): string {
+  const normalized = input.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  // Windows paths are case-insensitive; preserve case on case-sensitive platforms.
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function normalizeLesson(input: string): string {
+  return input.replace(/\s+/g, " ").replace(/[，。；：、,.\s;:]/g, "").trim().toLowerCase();
+}
+
 function summarize(lesson: string, max = 80): string {
   const oneLine = lesson.replace(/\s+/g, " ").trim();
   return oneLine.length > max ? oneLine.slice(0, max) + "…" : oneLine;
 }
 
-/**
- * Persist one smart_edit failure as a long-term rule (frontmatter file + index line).
- * Dedup: an existing rule of the same file+type is strengthened (hits++), never duplicated —
- * otherwise the memory store would grow its own duplicate residue.
- */
-export function rememberFailure(file: string, errorType: string, lesson: string): string {
-  mkdirSync(RULES_DIR, { recursive: true });
+function isInside(root: string, file: string): boolean {
+  const rel = relative(root, file);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
 
-  const slug = slugify(`${basename(file)}-${errorType}`);
-  const rulePath = join(RULES_DIR, `${slug}.md`);
+function resolveContext(file: string, errorType: string, options: RememberFailureOptions): RuleContext {
+  const absFile = resolve(file);
+  const projectRoot = resolve(options.projectRoot ?? process.cwd());
+  const rootName = basename(projectRoot) || "local";
+  // Two repositories can share a basename. Hash the root in the implicit id; callers that need a
+  // portable cross-machine identity should pass an explicit stable projectId.
+  const defaultProjectId = `${slugify(rootName)}-${fingerprint(normalizePath(projectRoot)).slice(0, 8)}`;
+  const projectId = slugify(options.projectId?.trim() || defaultProjectId);
+  const insideProject = isInside(projectRoot, absFile);
+  const relativePath = normalizePath(insideProject ? relative(projectRoot, absFile) : basename(absFile));
+  // Keep an outside-project path private in the record, but hash its full identity to avoid collisions.
+  const identityPath = normalizePath(insideProject ? relativePath : absFile);
+  const pathHash = fingerprint(`${projectId}:${identityPath}`).slice(0, 8);
+  const scope = options.scope ?? "file";
+  const causeCode = (options.causeCode?.trim() || "GENERIC").toUpperCase();
+  const globalId = slugify(`${errorType}-${causeCode}`);
+  const fileId = slugify(`${projectId}-${basename(relativePath)}-${pathHash}-${errorType}-${causeCode}`);
+  const id = scope === "global" ? globalId : fileId;
+  const rulePath = scope === "global"
+    ? join(GLOBAL_RULES_DIR, `${id}.json`)
+    : join(SCOPED_RULES_DIR, projectId, `${id}.json`);
+  return { scope, errorType, causeCode, projectId, relativePath, pathHash, id, rulePath };
+}
 
-  let hits = 1;
-  if (existsSync(rulePath)) {
-    const prev = readFileSync(rulePath, "utf8");
-    const m = prev.match(/hits:\s*(\d+)/);
-    hits = m ? parseInt(m[1], 10) + 1 : 2;
+function readRecord(path: string): RuleRecord {
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+  if (
+    typeof parsed !== "object" || parsed === null ||
+    (parsed as Partial<RuleRecord>).schemaVersion !== 2 ||
+    !Array.isArray((parsed as Partial<RuleRecord>).lessons)
+  ) throw new Error(`无效的 v2 记忆规则：${path}`);
+  return parsed as RuleRecord;
+}
+
+function listJsonRules(dir: string, recursive = false): RuleRecord[] {
+  if (!existsSync(dir)) return [];
+  const records: RuleRecord[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory() && recursive) records.push(...listJsonRules(path, true));
+    else if (entry.isFile() && entry.name.endsWith(".json")) {
+      try { records.push(readRecord(path)); } catch { /* isolate a corrupt hand-edited record */ }
+    }
   }
+  return records;
+}
 
-  const body =
-    `---\n` +
-    `name: ${slug}\n` +
-    `type: feedback\n` +
-    `trigger: 编辑 ${file} 之前\n` +
-    `hits: ${hits}\n` +
-    `---\n\n` +
-    `${lesson}\n\n` +
-    `（根因类型：${errorType}；已触发 ${hits} 次）\n`;
-  atomicWrite(rulePath, body);
+function sortRecords(records: RuleRecord[]): RuleRecord[] {
+  return records.sort(
+    (a, b) => b.hits - a.hits || b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id),
+  );
+}
 
-  const line = `- [${slug}](rules/${slug}.md) — ${summarize(lesson)}\n`;
-  let idx = existsSync(INDEX) ? readFileSync(INDEX, "utf8") : "# 编辑规则记忆索引\n\n开局注入：新会话开始时先读本文件，遵守其中已沉淀的规则。\n\n";
-  if (!idx.includes(`(rules/${slug}.md)`)) {
-    // Guarantee a newline boundary: a hand-written INDEX may end on a comment or a line with no
-    // trailing "\n", and bare `idx += line` would glue that line to the rule line (broken markdown).
-    if (idx.length > 0 && !idx.endsWith("\n")) idx += "\n";
-    idx += line;
-    atomicWrite(INDEX, idx);
+function mergeLesson(record: RuleRecord, lesson: string, now: string, increment: number): void {
+  const clean = lesson.trim();
+  const hash = fingerprint(normalizeLesson(clean)).slice(0, 8);
+  const existing = record.lessons.find((item) => item.hash === hash);
+  if (existing) {
+    existing.hits += increment;
+    existing.lastSeenAt = now;
+  } else {
+    record.lessons.push({ text: clean, hash, hits: increment, firstSeenAt: now, lastSeenAt: now });
   }
-
-  return `已沉淀规则 ${slug}（第 ${hits} 次）。`;
+  record.lessons.sort(
+    (a, b) => b.hits - a.hits || b.lastSeenAt.localeCompare(a.lastSeenAt) || a.hash.localeCompare(b.hash),
+  );
+  record.lessons = record.lessons.slice(0, MAX_LESSON_VARIANTS);
 }
 
-/**
- * Cap on how many rule bodies get injected at session start. The store grows unbounded
- * over a project's life, but injection cost must not: only the highest-hits (most-repeated)
- * rules are worth injecting in full. The long tail is injected as one-line summaries only
- * (path + lesson gist), readable in full on demand. Tune here if injection feels heavy/thin.
- */
-const MAX_INJECTED_RULES = 30;
-
-/** Read the `hits:` count from a rule's frontmatter; missing/malformed (e.g. hand-written) -> 1. */
-function parseHits(body: string): number {
-  const m = body.match(/hits:\s*(\d+)/);
-  return m ? parseInt(m[1], 10) : 1;
+function mergeExample(record: RuleRecord, context: RuleContext, now: string, increment: number): void {
+  const existing = record.examples.find(
+    (item) => item.projectId === context.projectId && item.relativePath === context.relativePath,
+  );
+  if (existing) {
+    existing.hits += increment;
+    existing.lastSeenAt = now;
+  } else {
+    record.examples.push({
+      projectId: context.projectId,
+      relativePath: context.relativePath,
+      hits: increment,
+      lastSeenAt: now,
+    });
+  }
+  record.examples.sort(
+    (a, b) => b.hits - a.hits || b.lastSeenAt.localeCompare(a.lastSeenAt) || a.relativePath.localeCompare(b.relativePath),
+  );
+  record.examples = record.examples.slice(0, MAX_EXAMPLES);
 }
 
-/**
- * Strip a rule file down to the lesson itself — the only part that guides future edits.
- * Drops the YAML frontmatter (name/type/trigger/hits: sorting/bookkeeping metadata, not
- * behavior) and the auto-appended provenance note "（根因类型：…；已触发 N 次）". Both are
- * dead weight in the injected context. Idempotent on hand-written rules that lack either.
- */
-function extractLesson(body: string): string {
-  return body
-    .replace(/^---\n[\s\S]*?\n---\n/, "")
-    .replace(/\n*（根因类型：[\s\S]*?）\s*$/, "")
-    .trim();
+function persistObservation(context: RuleContext, lesson: string, increment = 1): RuleRecord {
+  const now = new Date().toISOString();
+  mkdirSync(dirname(context.rulePath), { recursive: true });
+  const record: RuleRecord = existsSync(context.rulePath)
+    ? readRecord(context.rulePath)
+    : {
+        schemaVersion: 2, id: context.id, scope: context.scope,
+        errorType: context.errorType, causeCode: context.causeCode,
+        hits: 0, createdAt: now, updatedAt: now, lessons: [], examples: [],
+        ...(context.scope === "file" ? { target: {
+          projectId: context.projectId,
+          relativePath: context.relativePath,
+          pathHash: context.pathHash,
+        } } : {}),
+      };
+  record.hits += increment;
+  record.updatedAt = now;
+  mergeLesson(record, lesson, now, increment);
+  mergeExample(record, context, now, increment);
+  atomicWrite(context.rulePath, JSON.stringify(record, null, 2) + "\n");
+  appendIndexLine(record, context.rulePath);
+  return record;
 }
 
-/**
- * The human-authored INDEX preamble ONLY — its heading and framing lines, with the
- * auto-appended `- [slug](rules/…)` summary lines and the `<!-- example -->` comments removed.
- * Those summary lines are exactly what we must NOT re-inject: a Top-N rule already contributes
- * its full body below, so its index line would be a duplicate; low-freq summaries are rebuilt
- * fresh from the rules array (source of truth) rather than trusted from INDEX.
- */
+function appendIndexLine(record: RuleRecord, rulePath: string): void {
+  mkdirSync(MEM_DIR, { recursive: true });
+  const indexPath = normalizePath(relative(MEM_DIR, rulePath));
+  const line = `- [${record.id}](${indexPath}) — [${record.scope}] ${summarize(record.lessons[0]?.text ?? "")}\n`;
+  let index = existsSync(INDEX)
+    ? readFileSync(INDEX, "utf8")
+    : "# 编辑规则记忆索引\n\n开局注入：新会话开始时先读本文件，遵守其中已沉淀的规则。\n\n";
+  if (!index.includes(`(${indexPath})`)) {
+    if (index.length > 0 && !index.endsWith("\n")) index += "\n";
+    atomicWrite(INDEX, index + line);
+  }
+}
+
+/** Old callers remain valid and default to a file-scoped GENERIC rule. */
+export function rememberFailure(
+  file: string,
+  errorType: string,
+  lesson: string,
+  options: RememberFailureOptions = {},
+): string {
+  if (!lesson.trim()) throw new Error("lesson 不能为空");
+  const context = resolveContext(file, errorType, options);
+  const record = persistObservation(context, lesson);
+  return `已沉淀${context.scope === "global" ? "全局" : "文件"}规则 ${record.id}（第 ${record.hits} 次）。`;
+}
+
 function indexHeader(): string {
-  if (!existsSync(INDEX)) return "";
+  if (!existsSync(INDEX)) return "# Smart-Write 编辑规则";
   return readFileSync(INDEX, "utf8")
     .replace(/<!--[\s\S]*?-->/g, "")
     .split("\n")
-    .filter((l) => !l.trimStart().startsWith("- ["))
+    .filter((line) => !line.trimStart().startsWith("- ["))
     .join("\n")
-    .trim();
+    .trim() || "# Smart-Write 编辑规则";
 }
 
-/**
- * Aggregate persisted edit rules into one injectable markdown block:
- *  - a short header (the INDEX preamble, minus its redundant summary lines);
- *  - the full lesson (frontmatter/provenance stripped) of the top-MAX_INJECTED_RULES by hits;
- *  - the remaining low-freq rules as one-line summaries only (path + gist), readable on demand.
- * A Top-N rule therefore appears exactly once (body, no duplicate index line), and injection
- * cost stays bounded as the store grows. Returns "" when nothing has been remembered yet.
- */
+function primaryLesson(record: RuleRecord): string {
+  return record.lessons[0]?.text ?? "（规则正文为空）";
+}
+
+function renderRecord(record: RuleRecord): string {
+  const lessons = record.lessons.slice(0, 3).map((item) => item.text);
+  const body = lessons.length === 1
+    ? lessons[0]
+    : lessons.map((lesson, index) => `${index + 1}. ${lesson}`).join("\n");
+  return `## ${record.errorType} / ${record.causeCode}\n\n${body}\n\n> scope=${record.scope}；hits=${record.hits}`;
+}
+
+/** Startup injection: full global rules and scoped summaries only. */
 export function loadRules(): string {
-  if (!existsSync(RULES_DIR)) return "";
-
-  const rules = readdirSync(RULES_DIR)
-    .filter((f) => f.endsWith(".md"))
-    .map((f) => {
-      const body = readFileSync(join(RULES_DIR, f), "utf8");
-      return { f, lesson: extractLesson(body), hits: parseHits(body) };
-    })
-    // Highest hits first; ties broken by filename so output is deterministic across runs.
-    .sort((a, b) => b.hits - a.hits || a.f.localeCompare(b.f));
-
-  if (rules.length === 0) return "";
-
-  const header = indexHeader();
-  const parts: string[] = header ? [header] : [];
-
-  // High-freq: inject the lesson body only (no frontmatter, no provenance tail, no index line).
-  for (const r of rules.slice(0, MAX_INJECTED_RULES)) parts.push(r.lesson);
-
-  // Low-freq: one-line summary + path only, so injection stays bounded. Announced, never silent.
-  const tail = rules.slice(MAX_INJECTED_RULES);
-  if (tail.length > 0) {
-    const lines = tail
-      .map((r) => `- [${r.f.replace(/\.md$/, "")}](rules/${r.f}) — ${summarize(r.lesson)}`)
+  const globals = sortRecords(listJsonRules(GLOBAL_RULES_DIR)).slice(0, MAX_GLOBAL_RULES);
+  const scoped = sortRecords(listJsonRules(SCOPED_RULES_DIR, true));
+  if (globals.length === 0 && scoped.length === 0) return "";
+  const parts: string[] = [indexHeader()];
+  if (globals.length > 0) parts.push(`# 全局规则\n\n${globals.map(renderRecord).join("\n\n")}`);
+  if (scoped.length > 0) {
+    const lines = scoped.slice(0, MAX_SCOPED_SUMMARIES)
+      .map((rule) => `- ${rule.id}（hits=${rule.hits}）— ${summarize(primaryLesson(rule))}`)
       .join("\n");
-    parts.push(`另有 ${tail.length} 条低频规则未注入正文（需要时按 rules/ 路径读取）：\n${lines}`);
+    const hidden = Math.max(0, scoped.length - MAX_SCOPED_SUMMARIES);
+    parts.push(
+      `# 文件特例摘要\n\n${lines}` +
+      (hidden > 0 ? `\n\n另有 ${hidden} 条文件特例未在开局注入。` : "") +
+      "\n\n编辑具体文件前请调用 `recall_edit_rules` 获取精确规则。",
+    );
   }
+  return parts.join("\n\n---\n\n");
+}
 
+/** Return global rules plus exact file-scoped matches for the requested target. */
+export function loadRulesForFile(
+  file: string,
+  options: Pick<RememberFailureOptions, "projectRoot" | "projectId"> = {},
+): string {
+  const target = resolveContext(file, "Lookup", { ...options, scope: "file", causeCode: "LOOKUP" });
+  const globals = sortRecords(listJsonRules(GLOBAL_RULES_DIR));
+  const scoped = sortRecords(listJsonRules(join(SCOPED_RULES_DIR, target.projectId), true))
+    .filter((rule) => rule.target?.pathHash === target.pathHash);
+  if (globals.length === 0 && scoped.length === 0) {
+    return "（当前文件暂无适用的沉淀规则）";
+  }
+  const parts: string[] = [];
+  if (scoped.length > 0) parts.push(`# 当前文件特例\n\n${scoped.map(renderRecord).join("\n\n")}`);
+  if (globals.length > 0) parts.push(`# 全局规则\n\n${globals.slice(0, MAX_GLOBAL_RULES).map(renderRecord).join("\n\n")}`);
   return parts.join("\n\n---\n\n");
 }

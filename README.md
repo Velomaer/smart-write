@@ -19,19 +19,20 @@ read_file ──登记指纹──► smart_edit ──六道校验──► 写
                             │
                         失败被拦下（ERR/WARN）
                             │
-                     remember_failure ──归纳──► memory/rules/*.md
+                     remember_failure ──归纳──► memory/rules/{global,scoped}/*.json
                             │
                    新会话开局读 INDEX / smartwrite://rules ──► 同类错误不再犯
 ```
 
-### 对外暴露：3 个工具 + 1 个资源
+### 对外暴露：4 个工具 + 1 个资源
 
 | 名称 | 类型 | 作用 |
 |---|---|---|
 | `read_file` | 工具 | 读文件并登记内容指纹（sha256），建立"读后写"前提。返回文件全文。 |
 | `smart_edit` | 工具 | 定点唯一替换；写前 CAS 校验、锚点唯一、幂等，写后回读自检、原子写。支持 `preview=true` 干跑出 diff。 |
-| `remember_failure` | 工具 | 把一次失败归纳成规则写入 `memory/`（带查重，同类只累加不重复）。 |
-| `smartwrite://rules` | 资源 | 聚合已沉淀规则的 markdown 块，供新会话开局读取注入。 |
+| `remember_failure` | 工具 | 按“全局规则 / 文件特例”沉淀失败；支持稳定根因代码、项目标识和相对路径。 |
+| `recall_edit_rules` | 工具 | 编辑具体文件前，召回该文件的精确特例和跨文件全局规则。 |
+| `smartwrite://rules` | 资源 | 开局注入全局规则正文和文件特例摘要。 |
 
 ### `smart_edit` 的返回是**结构化信号**，直接决定 AI 下一步
 
@@ -52,10 +53,28 @@ read_file ──登记指纹──► smart_edit ──六道校验──► 写
 5. **M6 原子写**：临时文件 + `fdatasync` + `rename`，永不出现半写状态。
 6. **M5 写后自检**：回读校验 + 结构化查重（近似正则，能抓"整方法 / 类 / import / package 写两遍"）→ `WARN[Duplicate]`。
 
-### 记忆的沉淀与注入
+### 两级记忆的沉淀与召回
 
-- 失败被拦下 → `remember_failure` 归纳成带 frontmatter 的规则文件写入 `memory/rules/`。同 `文件+错误类型` 只累加 `hits`、**不新建文件**，所以规则数上界是 `唯一文件数 × 错误类型数`，不是失败次数。
-- 开局注入时，`smartwrite://rules` 资源按 **`hits` 降序取 Top-N（默认 30）** 注入规则**正文**——只保留 lesson 本体，剥掉 frontmatter（`name/type/trigger/hits`）和"(根因类型…)"尾注这些对"该怎么改"无指导的噪声。长尾（第 N+1 条起）**只注入一行摘要**（路径 + lesson 摘要，从 rules 现拼、不搭 INDEX 全文的便车），需要时按路径读取正文。高频规则因此**只出现一次**（正文，不再重复摘要行）。注入 token **有上界**，不随规则库无限膨胀。调整上限见 `src/memory.ts` 里的 `MAX_INJECTED_RULES`。
+- **全局规则**以 `error_type + cause_code` 为身份，例如 `Duplicate + NON_UNIQUE_ANCHOR`。不同文件发生相同根因会合并 `hits`，用于沉淀跨文件通用行为。
+- **文件特例**以 `project_id + 相对路径哈希 + error_type + cause_code` 为身份。同名但不同目录的文件不会碰撞，只在召回对应文件时注入。
+- JSON v2 规则把同一身份下的 lesson 变体和示例分别计数，避免新 lesson 覆盖旧经验；每条规则最多保留 5 个 lesson 和 10 个示例。
+- `smartwrite://rules` 开局注入 Top-20 全局规则正文和 Top-10 文件特例摘要；编辑具体文件前用 `recall_edit_rules` 获取精确文件特例。
+
+新版调用示例：
+
+```json
+{
+  "file": "D:/project/src/UserService.java",
+  "error_type": "Duplicate",
+  "cause_code": "NON_UNIQUE_ANCHOR",
+  "scope": "global",
+  "project_root": "D:/project",
+  "project_id": "demo",
+  "lesson": "old 出现多次时必须补充上下文使其唯一，不得退化为追加。"
+}
+```
+
+简化的三参数调用仍可使用，默认写成 `file / GENERIC` 规则。
 
 ---
 
@@ -119,7 +138,7 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 }
 ```
 
-重启客户端后，工具列表里应出现 `read_file` / `smart_edit` / `remember_failure`。
+重启客户端后，工具列表里应出现 `read_file` / `smart_edit` / `remember_failure` / `recall_edit_rules`。
 
 ### 5. 把 smart_edit 变成"唯一合法写入路径"（关键）
 
@@ -128,7 +147,7 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 ```markdown
 # 编辑纪律（强制）
 1. 禁止使用内置全量文件写入/覆盖。所有文件修改必须走 smart_edit 工具。
-2. 编辑任何文件前，必须先用 read_file 读取它（否则 smart_edit 会返回 ERR[Unread]）。
+2. 编辑任何文件前，先用 recall_edit_rules 召回适用规则，再用 read_file 读取它（否则 smart_edit 会返回 ERR[Unread]）。
 3. 写入分级（preview 只买"人工看 diff 再放行"，不买安全——M1~M6 六道校验在单步 preview=false 时同样全跑）：
    - **高风险改动**走两步：先以 preview=true 拿 diff 展示给用户，确认后再用**相同的 old/new** 以 preview=false 写入。高风险 = 改动范围大 / 关键路径 / 你对锚点或结果没把握 / 用户要求先看。
    - **低风险改动**（小范围、锚点明确、你有把握）可直接 preview=false 单步写入，省去 preview 往返。
@@ -137,7 +156,7 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
    - ERR[Stale]/ERR[NotFound] → 重新 read_file 再改；
    - ERR[Ambiguous] → 给 old 补充上下文使其唯一。
 5. 当同一文件累计 ≥2 次 ERR，或任务收尾时，调用 remember_failure 归纳规则。
-6. 每次新会话开局，先读取 <ABS_PATH>/memory/INDEX.md（或读取 MCP 资源 smartwrite://rules），遵守其中已沉淀的规则。
+6. 每次新会话开局读取 MCP 资源 smartwrite://rules；编辑具体文件前调用 recall_edit_rules，遵守其中已沉淀的全局规则和文件特例。
 ```
 
 ---
@@ -147,8 +166,8 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 1. 模型基于旧快照想改某文件；
 2. `smart_edit` 发现磁盘指纹不符 → `ERR[Stale]`，**写坏被拦下**；
 3. 规则要求重新 `read_file` 再改 → 成功；
-4. 同类 Stale 第 2 次 → `remember_failure(...)` 归纳成规则；
-5. 下次开局读 `INDEX.md`，模型开局就知道该文件要先重读 → 同类错误不再发生。
+4. 同类 Stale 第 2 次 → `remember_failure(...)` 按通用根因或文件特例归纳；
+5. 下次开局读取全局规则、编辑前精确召回文件特例 → 同类错误不再发生。
 
 ---
 
@@ -160,7 +179,8 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
   git update-index --skip-worktree memory/INDEX.md
   ```
 
-- `memory/rules/` 整个目录不入 git，是每个人本地跑出来的私有记忆。
+- `memory/rules/global/` 和 `memory/rules/scoped/` 是两级 JSON 事实源，整个 `memory/rules/` 不入 git，是每个人本地运行产生的私有记忆。
+- `memory/rules_old/` 仅作为旧数据人工备份，运行时不会扫描或注入。
 
 ---
 
@@ -169,4 +189,4 @@ pwd   # 例如 /Users/you/mcp/smart-write —— 下面用 <ABS_PATH> 指代它
 - `readRegistry` / `previewRegistry` 是**进程内内存**，客户端重启即清空 —— 这是有意的，它只在单次会话内有效；跨会话的持久知识全部沉淀在 `memory/`。
 - `duplicateScan` 的 Java 正则是够用的**近似版**，能拦住"整个方法被写两遍"这类典型残留；要严谨可换成基于 AST 的检测。
 - `smart_edit` 只做**单点唯一替换**，不支持一次多处替换（多处请多次调用，每次锚点唯一），这正是防重复的代价与保证。
-- Top-N 注入默认 30 条正文。真实项目跑久了规则变多时，靠 `hits` 排序让高频教训优先注入完整正文，第 31 条起降级为一行摘要；若嫌注入过重或过薄，改 `src/memory.ts` 的 `MAX_INJECTED_RULES`。
+- 开局默认注入 Top-20 全局规则正文和 Top-10 文件摘要；文件特例正文通过 `recall_edit_rules` 精确召回。可在 `src/memory.ts` 调整相应常量。

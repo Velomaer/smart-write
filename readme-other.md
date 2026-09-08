@@ -7,11 +7,12 @@
 
 同时会把每次失败**沉淀成规则**，下次开局自动提醒，同类错误不再犯。
 
-装好后会多出三个工具：
+装好后会多出四个工具：
 
 - `read_file` —— 读文件（编辑前必须先读）。
 - `smart_edit` —— 定点替换，写前校验、写后自检；改坏会被拦下并返回明确错误。
 - `remember_failure` —— 把失败归纳成长期规则。
+- `recall_edit_rules` —— 编辑具体文件前召回全局规则和该文件特例。
 
 ---
 
@@ -40,7 +41,7 @@ pwd                # 记下这个绝对路径，下一步要用
 }
 ```
 
-重启客户端，工具列表出现 `read_file` / `smart_edit` / `remember_failure` 即成功。
+重启客户端，工具列表出现 `read_file` / `smart_edit` / `remember_failure` / `recall_edit_rules` 即成功。
 
 ---
 
