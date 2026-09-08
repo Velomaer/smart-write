@@ -10,6 +10,7 @@
     "dev": "tsx src/server.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.js",
     "start": "node dist/server.js"
   },
   "dependencies": {

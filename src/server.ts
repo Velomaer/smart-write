@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fingerprint, performSmartEdit, readRegistry } from "./core.js";
-import { rememberFailure, loadRules } from "./memory.js";
+import { loadRules, loadRulesForFile, rememberFailure } from "./memory.js";
 
 const server = new McpServer({ name: "smart-write", version: "1.0.0" });
 
@@ -43,14 +43,36 @@ server.tool(
 
 server.tool(
   "remember_failure",
-  "将一次 smart_edit 失败归纳成长期规则并写入记忆库（带查重）。当同一文件累计 ≥2 次 ERR，或任务收尾复盘时调用。",
+  "将一次 smart_edit 失败归纳成两级长期规则。global 规则按错误类型+根因跨文件复用；file 规则按项目+相对路径+错误类型+根因精确匹配。省略新增参数时默认 file/GENERIC。",
   {
     file: z.string().describe("发生失败的文件"),
-    error_type: z.string().describe("根因类型：Stale/NotFound/Ambiguous/Duplicate/VerifyFail 等"),
+    error_type: z.string().describe("错误现象：Stale/NotFound/Ambiguous/Duplicate/VerifyFail 等"),
+    cause_code: z.string().optional().describe("稳定根因代码，如 NON_UNIQUE_ANCHOR、REPEATED_SUBMIT；默认 GENERIC"),
     lesson: z.string().describe("下次应改变的行为，一句话"),
+    scope: z.enum(["global", "file"]).optional().describe("global=跨文件通用；file=当前文件特例；默认 file"),
+    project_root: z.string().optional().describe("项目根目录，用于生成稳定的相对文件标识"),
+    project_id: z.string().optional().describe("项目稳定标识；默认使用 project_root 或当前目录名称"),
   },
-  async ({ file, error_type, lesson }) => {
-    return text(rememberFailure(file, error_type, lesson));
+  async ({ file, error_type, cause_code, lesson, scope, project_root, project_id }) => {
+    return text(rememberFailure(file, error_type, lesson, {
+      scope,
+      causeCode: cause_code,
+      projectRoot: project_root,
+      projectId: project_id,
+    }));
+  },
+);
+
+server.tool(
+  "recall_edit_rules",
+  "编辑具体文件前，召回适用于该文件的精确特例和全局规则。文件特例优先返回。",
+  {
+    file: z.string().describe("准备编辑的文件"),
+    project_root: z.string().optional().describe("项目根目录，需与沉淀文件规则时保持一致"),
+    project_id: z.string().optional().describe("项目稳定标识，需与沉淀文件规则时保持一致"),
+  },
+  async ({ file, project_root, project_id }) => {
+    return text(loadRulesForFile(file, { projectRoot: project_root, projectId: project_id }));
   },
 );
 
@@ -59,7 +81,7 @@ server.registerResource(
   "smartwrite://rules",
   {
     title: "Smart-Write 编辑规则",
-    description: "已沉淀的编辑失败规则（INDEX + rules/*）。新会话可读取本资源作为开局注入。",
+    description: "开局规则注入：全局规则正文与文件特例摘要。具体文件请再调用 recall_edit_rules。",
     mimeType: "text/markdown",
   },
   async (uri) => ({
